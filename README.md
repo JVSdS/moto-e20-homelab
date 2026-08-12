@@ -62,3 +62,29 @@ Depois do SSH hardening, tentei configurar `fail2ban` para banir automaticamente
 
 Alternativa considerada e descartada: trocar a ação de ban para editar `sshd_config` (`DenyUsers`) e reiniciar o serviço. Funcionaria, mas derrubaria todas as conexões SSH ativas a cada ban (não só a do IP infrator), o que é inaceitável em qualquer cenário real.
 
+## Investigação: tentativa de obter root real (bootloader unlock)
+
+Depois de esbarrar nas limitações do proot (UFW, fail2ban sem bloqueio automático), investiguei se valia a pena desbloquear o bootloader do Moto E20 e rootear o aparelho de verdade, para ter acesso ao kernel real e resolver essas limitações na raiz.
+
+**Diagnóstico técnico:**
+
+- Confirmado via `getprop ro.product.cpu.abilist`: o aparelho roda em modo 32 bits (armv7), sem `arm64-v8a` — hardware Unisoc T606.
+- Modelo confirmado: **XT2155-1**, codinome **aruba**, variante **RETBR** (Brasil/Manaus), build **RONS31.267-94-14**.
+- Segui o processo padrão de desbloqueio Motorola: ativei "Desbloqueio OEM" nas opções de desenvolvedor, instalei drivers corretos (o driver padrão do Windows não reconhece o modo Fastboot — foi necessário instalar manualmente o Google USB Driver via Gerenciador de Dispositivos), confirmei comunicação via `fastboot devices`.
+- `fastboot oem get_unlock_data`, `fastboot oem unlock`, `fastboot oem device-info`, `fastboot flashing unlock` e `fastboot flashing get_unlock_ability` retornam todos **`unknown cmd`** ou **`Not implement`** — nenhuma interface pública de desbloqueio está exposta nesse bootloader.
+- `fastboot oem get_identifier_token` funciona e retorna um token, assim como `getvar all` expõe campos como `tokenp1`, `unlock_raw_data` e `lcs: 5` — indícios de um mecanismo de identificação existente, mas sem uma interface documentada publicamente para completá-lo.
+
+**Pesquisa comunitária:**
+
+- Outros usuários com o mesmo aparelho exato (Moto E20 "aruba", diferentes variantes XT2155-x) relataram publicamente o mesmo erro, em Windows e Linux, incluindo tentativas com a ferramenta comunitária de desbloqueio Unisoc baseada em `get_identifier_token` (que falhou com `Unlock bootloader fail` mesmo em outro Unisoc T606).
+- O suporte oficial da Motorola, questionado sobre esse modelo especificamente, respondeu que a empresa não oferece suporte a esse tipo de modificação e que o aparelho não está no programa de desbloqueio de bootloader deles.
+- Existe uma vulnerabilidade documentada e publicamente divulgada para o Moto E20 (**CVE-2022-3917**, encontrada pela Pen Test Partners): um subcomando `fastboot oem pull` não documentado permitia leitura de RAM/partições via cold boot. Duas ressalvas importantes: (1) foi corrigida em firmware com SPL de 2022-08-05 ou posterior, e a build deste aparelho (`267-94-14`) é posterior à versão que recebeu a correção (`267-38-8`), então provavelmente já não é explorável aqui; (2) mesmo funcionando, era uma vulnerabilidade de **leitura**, não de escrita — não teria dado root de qualquer forma.
+- Não foi encontrado nenhum método documentado e reproduzível de desbloqueio de bootloader, boot temporário via RAM, ou root para o XT2155-1 nessa ou em builds próximas.
+
+**Decisão:** não prosseguir. As alternativas restantes (ferramentas de nível SPD/FDL, test point físico, exploração de firmware sem documentação confiável) têm risco real de brick permanente (não recuperável), documentação escassa especificamente para esse hardware, e nenhum relato de sucesso da comunidade mesmo entre quem tentou. O retorno esperado não justifica o risco.
+
+**Confirmação adicional (FDL/BootROM):** avaliei também a rota de comunicação direta com o chip via BootROM/FDL (camada abaixo do bootloader, usada por ferramentas de assistência técnica). Encontrei um relato público de alguém tentando exatamente esse caminho no mesmo aparelho (comando `unlock_bootloader` com arquivo `signature.bin`, método SPD/Unisoc documentado pela comunidade Hovatek) — resultado: `FAILED (remote: not implemented.)`. Ou seja, nem essa camada mais baixa consegue contornar o bloqueio nesse hardware específico. Esse foi o último caminho tecnicamente plausível considerado.
+
+Também vale registrar: existe uma ferramenta legítima de recuperação para esse modelo (SPD Upgrade Tool + firmware oficial `.pac`), usada para restaurar o aparelho ao estado de fábrica em caso de problemas de software. Isso não abre nenhum caminho para desbloqueio — é só uma rede de segurança separada, útil de se conhecer, mas que não muda a conclusão acima.
+
+O projeto segue sem root real nesse aparelho — as limitações relacionadas (UFW/nftables sem funcionar) permanecem documentadas como restrições conhecidas do ambiente proot, não como pendências a resolver.
