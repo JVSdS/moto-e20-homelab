@@ -88,3 +88,16 @@ Depois de esbarrar nas limitações do proot (UFW, fail2ban sem bloqueio automá
 Também vale registrar: existe uma ferramenta legítima de recuperação para esse modelo (SPD Upgrade Tool + firmware oficial `.pac`), usada para restaurar o aparelho ao estado de fábrica em caso de problemas de software. Isso não abre nenhum caminho para desbloqueio — é só uma rede de segurança separada, útil de se conhecer, mas que não muda a conclusão acima.
 
 O projeto segue sem root real nesse aparelho — as limitações relacionadas (UFW/nftables sem funcionar) permanecem documentadas como restrições conhecidas do ambiente proot, não como pendências a resolver.
+
+## Aplicação de exemplo: FastAPI como serviço persistente
+
+Depois de resolver o hardening de rede, subi uma aplicação real para validar a esteira completa: escrever código, isolar dependências, rodar como serviço e sobreviver a desconexões — sem depender de systemd (indisponível no proot).
+
+**Decisões:**
+
+- **Ambiente virtual Python (`venv`)**, em vez de instalar pacotes globalmente: evita conflito entre pacotes gerenciados pelo `apt` (Debian) e pelo `pip`. Na primeira tentativa, `pip install fastapi --break-system-packages` falhou tentando desinstalar uma dependência (`typing_extensions`) já instalada via `apt`, sem o arquivo de controle que o pip precisa para gerenciar upgrades com segurança. Isolar em `venv` resolveu de forma definitiva, e é boa prática de qualquer forma.
+- **`nohup` + redirecionamento de log** (`nohup uvicorn ... > app.log 2>&1 &`), em vez de um gerenciador de processos completo: sem systemd real no proot, essa é a forma mais simples de manter um processo rodando além da sessão SSH atual. Testado explicitamente: encerrei a sessão SSH e reconectei — a aplicação continuou respondendo.
+
+**Limitação conhecida:** diferente de um serviço gerenciado por systemd (ou supervisord), esse processo **não reinicia sozinho** se cair (erro na aplicação, reinício do celular, etc.). Isso é uma lacuna real, considerada aceitável nesta fase do projeto.
+
+**Endpoint exposto:** `GET /` retorna um JSON simples de health-check (status, hostname, timestamp) — sem lógica de negócio relevante; o objetivo desta etapa foi a infraestrutura de deploy, não a aplicação em si.
