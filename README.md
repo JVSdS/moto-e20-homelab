@@ -101,3 +101,24 @@ Depois de resolver o hardening de rede, subi uma aplicação real para validar a
 **Limitação conhecida:** diferente de um serviço gerenciado por systemd (ou supervisord), esse processo **não reinicia sozinho** se cair (erro na aplicação, reinício do celular, etc.). Isso é uma lacuna real, considerada aceitável nesta fase do projeto.
 
 **Endpoint exposto:** `GET /` retorna um JSON simples de health-check (status, hostname, timestamp) — sem lógica de negócio relevante; o objetivo desta etapa foi a infraestrutura de deploy, não a aplicação em si.
+
+## Watchdog: auto-recuperação via cron
+
+A limitação do `nohup` (processo não reinicia sozinho se cair) foi resolvida com um script de verificação agendado via `cron`.
+
+**Como funciona:**
+
+```
+A cada 1 minuto (cron):
+  watchdog.sh verifica se http://localhost:8000 responde 200
+    → se sim: registra OK no log
+    → se não: reinicia a aplicação (nohup uvicorn ... &) e registra a falha
+```
+
+**Decisões:**
+
+- Script (`watchdog.sh`) roda como usuário `devops`, não root — mantém o princípio de privilégio mínimo já aplicado no resto do projeto.
+- `cron`, assim como SSH e fail2ban, não inicia sozinho no boot nesse ambiente (sem systemd) — precisa ser iniciado manualmente (`cron`, como root) a cada sessão nova do Termux.
+- Log dedicado (`watchdog.log`) separado do log da aplicação (`app.log`), para diferenciar "a aplicação disse algo" de "o watchdog tomou uma ação".
+
+**Testado com falha simulada:** matei o processo manualmente (`pkill -f uvicorn`) e confirmei, no ciclo seguinte do cron (até 1 minuto depois), que o watchdog detectou a falha, reiniciou a aplicação (PID novo, confirmando restart real) e voltou a reportar OK na checagem seguinte.
