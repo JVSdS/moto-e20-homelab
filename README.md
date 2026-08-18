@@ -11,6 +11,9 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [x] Acesso remoto via SSH com autenticação por chave (sem senha)
 - [x] Hardening do SSH (sem login root, sem senha, MaxAuthTries)
 - [x] fail2ban configurado (detecção funcional; bloqueio automático limitado pelo ambiente — ver seção abaixo)
+- [x] Aplicação de exemplo (FastAPI) rodando como serviço persistente
+- [x] Watchdog via cron (auto-recuperação se a aplicação cair)
+- [x] Dashboard web com métricas do sistema (RAM, armazenamento; CPU indisponível — ver seção abaixo)
 
 ## Arquitetura
 
@@ -122,3 +125,21 @@ A cada 1 minuto (cron):
 - Log dedicado (`watchdog.log`) separado do log da aplicação (`app.log`), para diferenciar "a aplicação disse algo" de "o watchdog tomou uma ação".
 
 **Testado com falha simulada:** matei o processo manualmente (`pkill -f uvicorn`) e confirmei, no ciclo seguinte do cron (até 1 minuto depois), que o watchdog detectou a falha, reiniciou a aplicação (PID novo, confirmando restart real) e voltou a reportar OK na checagem seguinte.
+
+
+## Dashboard web e a limitação de leitura de CPU
+
+Depois do watchdog, adicionei um endpoint (`/api/status`) e uma página web simples (`/dashboard`) mostrando métricas do sistema em tempo real (atualização a cada 5s via JavaScript).
+
+**Funcionou sem problemas:** uso de RAM e armazenamento, lidos via `psutil` e `shutil.disk_usage`.
+
+**Não funcionou: percentual de uso de CPU.** `psutil.cpu_percent()` sempre retornava `0%`, mesmo gerando carga real no processador (testado com `yes > /dev/null &`). Investigação:
+
+- Comparei duas leituras de `/proc/stat` (fonte que o `psutil` usa para calcular uso de CPU) com 2 segundos de intervalo, dentro do proot — os valores vieram **idênticos**, mesmo logo após gerar carga real. Indica que o proot entrega uma cópia estática/cacheada desse arquivo, não uma leitura ao vivo do kernel.
+- Testei o mesmo `cat /proc/stat` **fora do proot**, direto no Termux nativo — resultado: `Permission denied`.
+
+**Conclusão:** essa não é uma limitação do proot especificamente — é uma restrição do próprio Android (via SELinux, a partir do Android 7), que bloqueia apps sem privilégios especiais de lerem `/proc/stat` de outros processos, por política de privacidade. O proot, ao rodar dentro dessa mesma restrição, aparenta contornar o bloqueio (o arquivo "parece" legível), mas na prática só expõe uma versão congelada, não dados reais.
+
+**Nota de precisão:** o que foi provado é que essa abordagem específica (leitura direta de `/proc/stat`) não funciona sem privilégios — não que seja impossível obter a métrica por qualquer via. Testei essa hipótese instalando `htop` (ferramenta madura, escrita em C, usada amplamente em ambientes Termux) diretamente no Termux nativo, fora do proot. Resultado: todos os núcleos além do 0 aparecem como `offline`, todo processo (inclusive o próprio `htop` rodando) mostra `CPU% = N/A`, e o `Load average` retorna `nan nan nan`. Ou seja, mesmo uma ferramenta consolidada, sem depender de `/proc/stat` da forma ingênua que o `psutil` usa, esbarra na mesma restrição — reforçando que não é uma limitação de método, mas da plataforma em si. Ainda assim, não foi testada a via do pacote `Termux:API` (que acessa informações através do próprio Android, não do kernel Linux emulado) — esse continua sendo o único caminho não descartado, e fica como possível item futuro, junto com a métrica de bateria (que também depende dele).
+
+**Decisão por ora:** o dashboard exibe "N/D (limitação proot)" no lugar do percentual de CPU, em vez de mostrar um número enganoso (0% constante poderia ser lido como "celular sempre ocioso", quando na verdade é "não é possível medir com o método atual"). RAM e armazenamento continuam confiáveis e são exibidos normalmente.
