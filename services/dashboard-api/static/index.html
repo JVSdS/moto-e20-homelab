@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <title>Moto E20 - Dashboard</title>
+    <style>
+        body {
+            background: #0d1117;
+            color: #c9d1d9;
+            font-family: monospace;
+            display: flex;
+            justify-content: center;
+            padding-top: 60px;
+        }
+        .card {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 24px 32px;
+            width: 320px;
+        }
+        h1 {
+            font-size: 18px;
+            border-bottom: 1px solid #30363d;
+            padding-bottom: 12px;
+        }
+        .row {
+            display: flex;
+            justify-content: space-between;
+            margin: 10px 0;
+        }
+        .bar-bg {
+            background: #21262d;
+            border-radius: 4px;
+            height: 8px;
+            width: 100%;
+            margin-top: 4px;
+        }
+        .bar-fill {
+            background: #3fb950;
+            height: 8px;
+            border-radius: 4px;
+            transition: width 0.5s;
+        }
+        .label { font-size: 13px; color: #8b949e; }
+        .status-ok { color: #3fb950; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>🖥️ MOTO E20 SERVER</h1>
+        <div class="row"><span class="label">Status</span><span class="status-ok">● Online</span></div>
+        <div class="row"><span class="label">Hostname</span><span id="hostname">-</span></div>
+
+        <div class="row"><span class="label">CPU</span><span id="cpu-text">-</span></div>
+        <div class="bar-bg"><div class="bar-fill" id="cpu-bar" style="width:0%"></div></div>
+
+        <div class="row" style="margin-top:16px"><span class="label">RAM</span><span id="ram-text">-</span></div>
+        <div class="bar-bg"><div class="bar-fill" id="ram-bar" style="width:0%"></div></div>
+
+        <div class="row" style="margin-top:16px"><span class="label">Armazenamento</span><span id="disk-text">-</span></div>
+        <div class="bar-bg"><div class="bar-fill" id="disk-bar" style="width:0%"></div></div>
+    </div>
+
+    <script>
+        async function updateStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+
+                document.getElementById('hostname').textContent = data.hostname;
+
+                if (data.cpu_percent === null) {
+                    document.getElementById('cpu-text').textContent = 'N/D (métrica indisponível)';
+                    document.getElementById('cpu-bar').style.width = '0%';
+                } else {
+                    document.getElementById('cpu-text').textContent = data.cpu_percent + '%';
+                    document.getElementById('cpu-bar').style.width = data.cpu_percent + '%';
+                }
+
+                const ramPercent = (data.ram_used_mb / data.ram_total_mb * 100).toFixed(1);
+                document.getElementById('ram-text').textContent =
+                    `${data.ram_used_mb} / ${data.ram_total_mb} MB`;
+                document.getElementById('ram-bar').style.width = ramPercent + '%';
+
+                const diskPercent = (data.disk_used_gb / data.disk_total_gb * 100).toFixed(1);
+                document.getElementById('disk-text').textContent =
+                    `${data.disk_used_gb} / ${data.disk_total_gb} GB`;
+                document.getElementById('disk-bar').style.width = diskPercent + '%';
+            } catch (e) {
+                document.querySelector('.status-ok').textContent = '● Offline';
+            }
+        }
+
+        updateStatus();
+        setInterval(updateStatus, 5000);
+    </script>
+</body>
+</html>
