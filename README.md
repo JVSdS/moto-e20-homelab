@@ -14,6 +14,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [x] Aplicação de exemplo (FastAPI) rodando como serviço persistente
 - [x] Watchdog via cron (auto-recuperação se a aplicação cair)
 - [x] Dashboard web com métricas do sistema (RAM, armazenamento; CPU indisponível — ver seção abaixo)
+- [x] Autenticação HTTP Basic Auth protegendo API e dashboard
 
 ## Arquitetura
 
@@ -143,3 +144,20 @@ Depois do watchdog, adicionei um endpoint (`/api/status`) e uma página web simp
 **Nota de precisão:** o que foi provado é que essa abordagem específica (leitura direta de `/proc/stat`) não funciona sem privilégios — não que seja impossível obter a métrica por qualquer via. Testei essa hipótese instalando `htop` (ferramenta madura, escrita em C, usada amplamente em ambientes Termux) diretamente no Termux nativo, fora do proot. Resultado: todos os núcleos além do 0 aparecem como `offline`, todo processo (inclusive o próprio `htop` rodando) mostra `CPU% = N/A`, e o `Load average` retorna `nan nan nan`. Ou seja, mesmo uma ferramenta consolidada, sem depender de `/proc/stat` da forma ingênua que o `psutil` usa, esbarra na mesma restrição — reforçando que há uma limitação da plataforma para as abordagens testadas até agora. Ainda assim, não foi testada a via do pacote `Termux:API`, que consulta informações através das APIs do próprio Android, em vez de depender diretamente das interfaces `/proc` expostas ao Termux — esse continua sendo um caminho ainda não testado, e fica como possível item futuro, junto com a métrica de bateria (que também depende dele).
 
 **Decisão por ora:** o dashboard exibe "N/D (métrica indisponível)" no lugar do percentual de CPU, em vez de mostrar um número enganoso (0% constante poderia ser lido como "celular sempre ocioso", quando na verdade é "não é possível medir com o método atual"). RAM e armazenamento continuam confiáveis e são exibidos normalmente.
+
+## Autenticação: protegendo a API e o dashboard
+
+`/api/status` e `/dashboard` estavam publicamente acessíveis a qualquer um na mesma rede, sem nenhuma barreira. Adicionei autenticação para fechar essa lacuna.
+
+**Solução escolhida: HTTP Basic Auth**, via middleware do Starlette, em vez de uma tela de login customizada:
+
+- Aplica-se a toda rota, exceto `/` (health-check simples, mantido público de propósito).
+- Credencial única (usuário fixo + senha aleatória gerada com `secrets.token_hex(32)`), guardada em `.env` (nunca commitado — protegido tanto pelo `.gitignore` da pasta do serviço quanto pelo da raiz do repositório).
+- Comparação de senha feita com `secrets.compare_digest`, em vez de `==`, seguindo uma abordagem resistente a ataques de timing.
+- Como o `StaticFiles` do FastAPI não tem suporte nativo a autenticação por header, a proteção foi implementada como middleware — cobre tanto os endpoints da API quanto os arquivos estáticos do dashboard de forma unificada, sem precisar duplicar lógica.
+
+**Limitação conhecida:** HTTP Basic Auth transmite as credenciais codificadas em Base64 (não criptografadas) a cada requisição — vulnerável à interceptação por um atacante capaz de observar o tráfego da rede. Isso é aceitável neste projeto porque a API foi projetada para uso exclusivamente dentro de uma rede local controlada, sem requisito de segurança contra esse tipo de ameaça. Para exposição fora da rede local, HTTPS seria obrigatório. O problema fundamental é a ausência de criptografia no transporte, independentemente do mecanismo de autenticação utilizado (Basic Auth, sessão, JWT etc.).
+
+**Validado com bateria de 7 testes** (rota pública sem credenciais, rota protegida sem credenciais, com credenciais corretas, com credenciais erradas, dashboard sem/com credenciais, teste visual no navegador, e confirmação de que `.env` nunca aparece no `git status`) — todos passaram como esperado.
+
+**Imprevisto registrado:** durante a sincronização dos arquivos para o repositório, a função "Download Folder" da extensão SFTP do VS Code sobrescreveu vários arquivos locais (`main.py`, `requirements.txt`, `static/index.html`) com conteúdo vazio, sem aviso de erro visível. Recuperado copiando o conteúdo real diretamente do celular (fonte da verdade) via `cat` na sessão SSH. Lição prática: sempre verificar conteúdo (`wc -l`, `cat`) depois de qualquer sincronização automática antes de commitar — "sincronizou sem erro aparente" não é garantia de que o conteúdo chegou íntegro.
