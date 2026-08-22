@@ -13,10 +13,25 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [x] fail2ban configurado (detecção funcional; bloqueio automático limitado pelo ambiente — ver seção abaixo)
 - [x] Aplicação de exemplo (FastAPI) rodando como serviço persistente
 - [x] Watchdog via cron (auto-recuperação se a aplicação cair)
-- [x] Dashboard web com métricas do sistema (RAM, armazenamento; CPU indisponível — ver seção abaixo)
+- [x] Dashboard web com métricas do sistema (RAM, armazenamento e bateria; CPU indisponível — ver seção abaixo)
 - [x] Autenticação HTTP Basic Auth protegendo API e dashboard
 - [x] Bateria real integrada ao dashboard via ponte Termux:API
-- [x] Script de startup único e idempotente (SSH, cron, fail2ban, aplicação, ponte de bateria)
+- [x] Inicialização centralizada e idempotente dos serviços
+
+## Índice
+
+- [Arquitetura](#arquitetura)
+- [Por que Debian, e não Arch ou Ubuntu](#por-que-debian-e-não-arch-ou-ubuntu)
+- [Decisões de segurança](#decisões-de-segurança-tomadas-até-aqui)
+- [Problemas encontrados e soluções](#problemas-encontrados-e-soluções)
+- [Fail2ban](#fail2ban-detecção-funciona-bloqueio-automático-não-nesse-ambiente)
+- [Investigação: root real](#investigação-tentativa-de-obter-root-real-bootloader-unlock)
+- [FastAPI](#aplicação-de-exemplo-fastapi-como-serviço-persistente)
+- [Watchdog](#watchdog-auto-recuperação-via-cron)
+- [Dashboard e limitação de CPU](#dashboard-web-e-a-limitação-de-leitura-de-cpu)
+- [Autenticação](#autenticação-protegendo-a-api-e-o-dashboard)
+- [Bateria](#bateria-real-via-ponte-termuxapi)
+- [Inicialização](#script-de-inicialização-único-e-idempotente)
 
 ## Arquitetura
 
@@ -30,7 +45,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 
 ## Por que Debian, e não Arch ou Ubuntu
 
-Meu objetivo inicial era usar o Arch, mas o Moto E20 usa um chip que roda o Android em modo 32 bits (armv7), confirmado via:
+O hardware usa arquitetura ARMv8, mas o Android expõe apenas um userspace 32-bit compatível com ARMv7, sem suporte a `arm64-v8a` — confirmado via:
 
 ```bash
 uname -m              # armv8l (userspace 32 bits)
@@ -44,27 +59,29 @@ O Arch Linux ARM descontinuou suporte a armv7 (32 bits), então não roda nesse 
 | Decisão | Motivo |
 |---|---|
 | Usuário `devops` dedicado, sem rodar tudo como root | Least privilege — mesmo princípio de papéis personalizados do IAM |
-| Autenticação SSH por chave (ed25519), não por senha | Evita que a senha trafegue pela rede; resistente a força bruta |
+| Autenticação SSH por chave (ed25519), não por senha | Elimina autenticação por senha e reduz a superfície para ataques de força bruta; a chave privada permanece protegida por passphrase |
 | Chave privada protegida por passphrase | Mesmo se o arquivo da chave vazar, ainda é necessária a senha para usá-la |
-| SSH na porta 8022, não 22 | Necessidade técnica do ambiente proot (processos não-root não podem abrir portas < 1024); irei decidir de mantenho com a evolução do projeto |
+| SSH na porta 8022, não 22 | O `sshd` dentro do proot não consegue fazer bind na porta privilegiada 22 nesse ambiente; 8022 é usada como alternativa |
 
 ## Problemas encontrados e soluções
 
+Principais problemas encontrados durante a montagem inicial (os mais relevantes são detalhados nas seções específicas abaixo):
+
 - **`proot-distro install archlinux` falhou** com erro de arquitetura → resolvido trocando para Debian (ver seção acima).
-- **`sshd` não conseguia abrir a porta 22** (`Permission denied`) → causa: porta privilegiada não pode ser aberta por processo sem root real; resolvido mudando para porta 8022 em `/etc/ssh/sshd_config`.
+- **`sshd` não conseguia abrir a porta 22** (`Permission denied`) → nesse ambiente, o `sshd` dentro do proot não consegue fazer bind na porta privilegiada; resolvido mudando para a porta 8022 em `/etc/ssh/sshd_config`.
 - **`ssh-copy-id` falhou com aviso de host key alterada** → esperado, pois o servidor SSH mudou (do nativo do Termux para o do Debian); resolvido com `ssh-keygen -R`.
 
 ## Fail2ban: detecção funciona, bloqueio automático não (nesse ambiente)
 
 Depois do SSH hardening, tentei configurar `fail2ban` para banir automaticamente IPs com tentativas repetidas de login falho. O processo envolveu resolver várias camadas de limitação do ambiente proot:
 
-- **UFW/iptables não funciona no proot**: falha com `Couldn't determine iptables version`, porque o proot não tem acesso real ao subsistema de rede do kernel (esse kernel é o do Android, fora do alcance do container simulado).
+- **UFW/iptables não funciona no proot**: falha com `Couldn't determine iptables version`, porque o proot não fornece acesso privilegiado ao subsistema de rede do kernel Android (esse kernel é o do Android, fora do alcance do container simulado).
 - **rsyslog não escrevia `/var/log/auth.log`** por padrão nessa imagem mínima (faltava `/etc/rsyslog.d/50-default.conf`). Mesmo depois de criar a regra manualmente, o log continuou vazio — provável limitação do socket `/dev/log` dentro do proot.
 - **Solução**: fazer o próprio `sshd` escrever logs direto em arquivo, contornando o syslog inteiro (`sshd -E /var/log/auth.log`).
 - **Filtro padrão do fail2ban (incluindo modo `aggressive`) não reconhecia** o formato de mensagem `Connection closed by authenticating user ... [preauth]`, gerado nas versões mais recentes do OpenSSH. Resolvido escrevendo um filtro customizado (`/etc/fail2ban/filter.d/sshd-custom.conf`), validado com `fail2ban-regex` antes de aplicar.
 - **Resultado parcial**: o fail2ban passou a **detectar** corretamente as tentativas de força bruta (`Currently banned: 1` aparece no status). Porém, a ação de ban padrão usa `nftables`, que — assim como o UFW — precisa de acesso real ao kernel de rede para criar regras. Nesse ambiente, o ban é registrado internamente, mas **não bloqueia a conexão de fato** (testado: consegui logar normalmente mesmo com o IP marcado como banido).
 
-**Conclusão**: nesse ambiente (proot sem kernel real), é possível implementar a camada de **detecção** de ataques, mas não a de **prevenção automática por bloqueio de rede**. Numa VPS real (com kernel próprio e acesso a `netfilter`/`nftables`), essa mesma configuração de fail2ban funcionaria de ponta a ponta sem ajustes adicionais — é uma limitação específica de rodar Linux dentro de um container não-privilegiado sobre Android, não um erro de configuração.
+**Conclusão**: nesse ambiente proot, sem acesso privilegiado ao netfilter do kernel Android, é possível implementar a camada de **detecção** de ataques, mas não a de **prevenção automática por bloqueio de rede**. Em uma VPS Linux convencional com acesso ao netfilter/nftables, essa abordagem teria condições de realizar também o bloqueio automático, embora a configuração possa exigir ajustes conforme o ambiente.
 
 Alternativa considerada e descartada: trocar a ação de ban para editar `sshd_config` (`DenyUsers`) e reiniciar o serviço. Funcionaria, mas derrubaria todas as conexões SSH ativas a cada ban (não só a do IP infrator), o que é inaceitável em qualquer cenário real.
 
@@ -80,7 +97,7 @@ Depois de esbarrar nas limitações do proot (UFW, fail2ban sem bloqueio automá
 - `fastboot oem get_unlock_data`, `fastboot oem unlock`, `fastboot oem device-info`, `fastboot flashing unlock` e `fastboot flashing get_unlock_ability` retornam todos **`unknown cmd`** ou **`Not implement`** — nenhuma interface pública de desbloqueio está exposta nesse bootloader.
 - `fastboot oem get_identifier_token` funciona e retorna um token, assim como `getvar all` expõe campos como `tokenp1`, `unlock_raw_data` e `lcs: 5` — indícios de um mecanismo de identificação existente, mas sem uma interface documentada publicamente para completá-lo.
 
-**Pesquisa comunitária:**
+**Evidências externas:**
 
 - Outros usuários com o mesmo aparelho exato (Moto E20 "aruba", diferentes variantes XT2155-x) relataram publicamente o mesmo erro, em Windows e Linux, incluindo tentativas com a ferramenta comunitária de desbloqueio Unisoc baseada em `get_identifier_token` (que falhou com `Unlock bootloader fail` mesmo em outro Unisoc T606).
 - O suporte oficial da Motorola, questionado sobre esse modelo especificamente, respondeu que a empresa não oferece suporte a esse tipo de modificação e que o aparelho não está no programa de desbloqueio de bootloader deles.
@@ -124,7 +141,7 @@ A cada 1 minuto (cron):
 **Decisões:**
 
 - Script (`watchdog.sh`) roda como usuário `devops`, não root — mantém o princípio de privilégio mínimo já aplicado no resto do projeto.
-- `cron`, assim como SSH e fail2ban, não inicia sozinho no boot nesse ambiente (sem systemd) — precisa ser iniciado manualmente (`cron`, como root) a cada sessão nova do Termux.
+- `cron`, assim como SSH e fail2ban, não inicia sozinho nesse ambiente (sem systemd). Inicialmente isso exigia inicialização manual a cada reinício; posteriormente, o `start-homelab.sh` passou a automatizar essa etapa (ver seção "Script de inicialização único e idempotente").
 - Log dedicado (`watchdog.log`) separado do log da aplicação (`app.log`), para diferenciar "a aplicação disse algo" de "o watchdog tomou uma ação".
 
 **Testado com falha simulada:** matei o processo manualmente (`pkill -f uvicorn`) e confirmei, no ciclo seguinte do cron (até 1 minuto depois), que o watchdog detectou a falha, reiniciou a aplicação (PID novo, confirmando restart real) e voltou a reportar OK na checagem seguinte.
@@ -132,18 +149,20 @@ A cada 1 minuto (cron):
 
 ## Dashboard web e a limitação de leitura de CPU
 
-Depois do watchdog, adicionei um endpoint (`/api/status`) e uma página web simples (`/dashboard`) mostrando métricas do sistema em tempo real (atualização a cada 5s via JavaScript).
+Depois do watchdog, adicionei um endpoint (`/api/status`) e uma página web simples (`/dashboard`) mostrando métricas do sistema com atualização periódica — o dashboard consulta `/api/status` a cada 5s via JavaScript.
 
 **Funcionou sem problemas:** uso de RAM e armazenamento, lidos via `psutil` e `shutil.disk_usage`.
 
 **Não funcionou: percentual de uso de CPU.** `psutil.cpu_percent()` sempre retornava `0%`, mesmo gerando carga real no processador (testado com `yes > /dev/null &`). Investigação:
 
-- Comparei duas leituras de `/proc/stat` (fonte que o `psutil` usa para calcular uso de CPU) com 2 segundos de intervalo, dentro do proot — os valores vieram **idênticos**, mesmo logo após gerar carga real. Indica que o proot entrega uma cópia estática/cacheada desse arquivo, não uma leitura ao vivo do kernel.
+- Comparei duas leituras de `/proc/stat` (fonte que o `psutil` usa para calcular uso de CPU) com 2 segundos de intervalo, dentro do proot — os valores vieram **idênticos**, mesmo logo após gerar carga real. Indica que, nesse ambiente, o `/proc/stat` exposto pelo proot não reflete alterações em tempo real do kernel.
 - Testei o mesmo `cat /proc/stat` **fora do proot**, direto no Termux nativo — resultado: `Permission denied`.
 
-**Conclusão:** é uma restrição do próprio ambiente Android, que impede o Termux sem privilégios de acessar `/proc/stat` diretamente — mesmo fora do proot. O proot, ao rodar dentro dessa mesma restrição, aparenta contornar o bloqueio (o arquivo "parece" legível), mas na prática só expõe uma versão congelada, não dados reais.
+**Conclusão:** é uma restrição do próprio ambiente Android, que impede o Termux sem privilégios de acessar `/proc/stat` diretamente — mesmo fora do proot. O proot aparenta contornar o bloqueio (o arquivo "parece" legível), mas os valores observados não refletem alterações em tempo real.
 
-**Nota de precisão:** o que foi provado é que essa abordagem específica (leitura direta de `/proc/stat`) não funciona sem privilégios — não que seja impossível obter a métrica por qualquer via. Testei essa hipótese instalando `htop` (ferramenta madura, escrita em C, usada amplamente em ambientes Termux) diretamente no Termux nativo, fora do proot. Resultado: todos os núcleos além do 0 aparecem como `offline`, todo processo (inclusive o próprio `htop` rodando) mostra `CPU% = N/A`, e o `Load average` retorna `nan nan nan`. Ou seja, mesmo uma ferramenta consolidada, sem depender de `/proc/stat` da forma ingênua que o `psutil` usa, esbarra na mesma restrição — reforçando que há uma limitação da plataforma para as abordagens testadas até agora. Ainda assim, não foi testada a via do pacote `Termux:API`, que consulta informações através das APIs do próprio Android, em vez de depender diretamente das interfaces `/proc` expostas ao Termux — esse continua sendo um caminho ainda não testado, e fica como possível item futuro, junto com a métrica de bateria (que também depende dele).
+**Nota de precisão:** o que foi provado é que essa abordagem específica (leitura direta de `/proc/stat`) não funciona sem privilégios — não que seja impossível obter a métrica por qualquer via. Testei essa hipótese instalando `htop` (ferramenta madura, escrita em C, usada amplamente em ambientes Termux) diretamente no Termux nativo, fora do proot. Resultado: todos os núcleos além do 0 aparecem como `offline`, todo processo (inclusive o próprio `htop` rodando) mostra `CPU% = N/A`, e o `Load average` retorna `nan nan nan`. Mesmo uma ferramenta consolidada, sem depender de `/proc/stat` da forma ingênua que o `psutil` usa, esbarra na mesma restrição.
+
+**Conclusão:** as abordagens testadas até aqui — leitura de `/proc/stat`, `psutil`, `htop` e `Termux:API` — não forneceram uma métrica de uso de CPU confiável. A `Termux:API` foi testada posteriormente (ver seção "Bateria real via ponte Termux:API") e também não oferece um comando específico para essa métrica.
 
 **Decisão por ora:** o dashboard exibe "N/D (métrica indisponível)" no lugar do percentual de CPU, em vez de mostrar um número enganoso (0% constante poderia ser lido como "celular sempre ocioso", quando na verdade é "não é possível medir com o método atual"). RAM e armazenamento continuam confiáveis e são exibidos normalmente.
 
@@ -158,17 +177,17 @@ Depois do watchdog, adicionei um endpoint (`/api/status`) e uma página web simp
 - Comparação de senha feita com `secrets.compare_digest`, em vez de `==`, seguindo uma abordagem resistente a ataques de timing.
 - Como o `StaticFiles` do FastAPI não tem suporte nativo a autenticação por header, a proteção foi implementada como middleware — cobre tanto os endpoints da API quanto os arquivos estáticos do dashboard de forma unificada, sem precisar duplicar lógica.
 
-**Limitação conhecida:** HTTP Basic Auth transmite as credenciais codificadas em Base64 (não criptografadas) a cada requisição — vulnerável à interceptação por um atacante capaz de observar o tráfego da rede. Isso é aceitável neste projeto porque a API foi projetada para uso exclusivamente dentro de uma rede local controlada, sem requisito de segurança contra esse tipo de ameaça. Para exposição fora da rede local, HTTPS seria obrigatório. O problema fundamental é a ausência de criptografia no transporte, independentemente do mecanismo de autenticação utilizado (Basic Auth, sessão, JWT etc.).
+**Limitação conhecida:** HTTP Basic Auth envia as credenciais codificadas em Base64 a cada requisição; Base64 não fornece criptografia, o que deixa as credenciais vulneráveis à interceptação por um atacante capaz de observar o tráfego da rede. Isso é aceitável neste projeto porque a API foi projetada para uso exclusivamente dentro de uma rede local controlada, sem requisito de segurança contra esse tipo de ameaça. Para exposição fora da rede local, o serviço deveria ser protegido por HTTPS. O problema fundamental é a ausência de criptografia no transporte, independentemente do mecanismo de autenticação utilizado (Basic Auth, sessão, JWT etc.).
 
 **Validado com bateria de 7 testes** (rota pública sem credenciais, rota protegida sem credenciais, com credenciais corretas, com credenciais erradas, dashboard sem/com credenciais, teste visual no navegador, e confirmação de que `.env` nunca aparece no `git status`) — todos passaram como esperado.
 
-**Imprevisto registrado:** durante a sincronização dos arquivos para o repositório, a função "Download Folder" da extensão SFTP do VS Code sobrescreveu vários arquivos locais (`main.py`, `requirements.txt`, `static/index.html`) com conteúdo vazio, sem aviso de erro visível. Recuperado copiando o conteúdo real diretamente do celular (fonte da verdade) via `cat` na sessão SSH. Lição prática: sempre verificar conteúdo (`wc -l`, `cat`) depois de qualquer sincronização automática antes de commitar — "sincronizou sem erro aparente" não é garantia de que o conteúdo chegou íntegro.
+**Lição aprendida:** durante a sincronização dos arquivos para o repositório, a função "Download Folder" da extensão SFTP do VS Code sobrescreveu vários arquivos locais (`main.py`, `requirements.txt`, `static/index.html`) com conteúdo vazio, sem aviso de erro visível. Recuperado copiando o conteúdo real diretamente do celular (fonte da verdade) via `cat` na sessão SSH. "Sincronizou sem erro aparente" não é garantia de que o conteúdo chegou íntegro — passei a sempre verificar conteúdo (`wc -l`, `cat`) depois de qualquer sincronização automática antes de commitar.
 
 ## Bateria real via ponte Termux:API
 
-A investigação da limitação de CPU (seção acima) deixou uma pista não testada: o pacote `Termux:API`, que acessa informações do sistema através das APIs do próprio Android, em vez de depender diretamente de `/proc`. Testei essa via — não resolveu CPU, mas resolveu bateria, que também estava pendente.
+A investigação da limitação de CPU (seção acima) deixou uma pista para investigar: o pacote `Termux:API`, que acessa informações do sistema através das APIs do próprio Android, em vez de depender diretamente de `/proc`. Testei essa via — não resolveu CPU, mas resolveu bateria, que também estava pendente.
 
-**Descoberta sobre CPU:** `ls` nos binários `termux-*` mostra comandos para bateria, sensores, telefonia, câmera, áudio, Wi-Fi etc., mas nenhum para CPU/carga do sistema. Não encontrei uma API pública acessível ao Termux que forneça essa métrica de forma confiável. CPU permanece "N/D" no dashboard.
+**CPU:** o `Termux:API` não oferece comando para uso de CPU. A investigação completa está na seção [Dashboard web e a limitação de leitura de CPU](#dashboard-web-e-a-limitação-de-leitura-de-cpu).
 
 **Bateria funcionou.** `termux-battery-status` retorna dados reais (percentual, status de carga, temperatura, saúde) — mas só funciona no Termux nativo, fora do proot, e a aplicação FastAPI roda dentro do proot. Foi necessário construir uma ponte:
 
@@ -188,7 +207,7 @@ battery-bridge.sh (loop 30s)
 
 **Problema encontrado:** chamadas a `termux-battery-status` feitas pelo script em segundo plano (via `nohup`) ficavam bloqueadas indefinidamente, mesmo funcionando normalmente quando rodado de forma interativa.
 
-**Causa:** otimização de bateria do Android no dispositivo Motorola, fazendo com que o app companheiro Termux:API deixasse de responder a chamadas feitas em background.
+**Causa:** otimização de bateria do Android no dispositivo Motorola, aparentemente fazendo com que o app companheiro Termux:API deixasse de responder a chamadas feitas em background.
 
 **Solução:** desativação da otimização de bateria especificamente para o app Termux:API (`Ajustes > Apps > Termux:API > Bateria > Sem restrições`) e reinicialização completa do Termux.
 
@@ -196,7 +215,7 @@ battery-bridge.sh (loop 30s)
 
 **Resultado:** dashboard agora exibe percentual de bateria e status de carga (carregando/descarregando), atualizados a cada 30 segundos, junto com RAM e armazenamento.
 
-## Script de startup único e idempotente
+## Script de inicialização único e idempotente
 
 Toda vez que o processo do Termux era encerrado (reinício do celular, app fechado pelo sistema, etc.), era necessário religar manualmente cinco componentes espalhados em duas camadas diferentes (SSH, cron, fail2ban e a aplicação dentro do proot; a ponte de bateria no Termux nativo) — repetitivo e propenso a esquecimento. Consolidei tudo em dois scripts encadeados.
 
@@ -214,4 +233,4 @@ Toda vez que o processo do Termux era encerrado (reinício do celular, app fecha
 
 **Decisão de design: idempotência.** A primeira versão simplesmente iniciava tudo sem checar se já estava rodando — rodar o script duas vezes seguidas duplicou o processo da aplicação (dois `uvicorn` disputando a porta 8000). Corrigido adicionando uma verificação (`pgrep`) antes de cada ação: cada componente só é iniciado se ainda não estiver ativo, tornando seguro executar o script repetidamente sem duplicar os processos já ativos.
 
-**Uso:** um único comando (`~/start-homelab.sh`, no Termux nativo) substitui a sequência manual de comandos que era necessária a cada reinício.
+**Uso:** um único comando (`~/start-homelab.sh`, no Termux nativo) substitui a sequência manual de comandos que era necessária sempre que o processo do Termux era encerrado.
