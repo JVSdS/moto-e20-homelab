@@ -60,6 +60,9 @@
 
         <div class="row" style="margin-top:16px"><span class="label">Armazenamento</span><span id="disk-text">-</span></div>
         <div class="bar-bg"><div class="bar-fill" id="disk-bar" style="width:0%"></div></div>
+
+        <div class="row" style="margin-top:16px"><span class="label">Bateria</span><span id="battery-text">-</span></div>
+        <div class="bar-bg"><div class="bar-fill" id="battery-bar" style="width:0%"></div></div>
     </div>
 
     <script>
@@ -87,6 +90,15 @@
                 document.getElementById('disk-text').textContent =
                     `${data.disk_used_gb} / ${data.disk_total_gb} GB`;
                 document.getElementById('disk-bar').style.width = diskPercent + '%';
+
+                if (data.battery) {
+                    document.getElementById('battery-text').textContent =
+                        `${data.battery.percentage}% (${data.battery.status})`;
+                    document.getElementById('battery-bar').style.width = data.battery.percentage + '%';
+                } else {
+                    document.getElementById('battery-text').textContent = 'N/D';
+                    document.getElementById('battery-bar').style.width = '0%';
+                }
             } catch (e) {
                 document.querySelector('.status-ok').textContent = '● Offline';
             }

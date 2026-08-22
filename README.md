@@ -15,6 +15,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [x] Watchdog via cron (auto-recuperação se a aplicação cair)
 - [x] Dashboard web com métricas do sistema (RAM, armazenamento; CPU indisponível — ver seção abaixo)
 - [x] Autenticação HTTP Basic Auth protegendo API e dashboard
+- [x] Bateria real integrada ao dashboard via ponte Termux:API
 
 ## Arquitetura
 
@@ -161,3 +162,35 @@ Depois do watchdog, adicionei um endpoint (`/api/status`) e uma página web simp
 **Validado com bateria de 7 testes** (rota pública sem credenciais, rota protegida sem credenciais, com credenciais corretas, com credenciais erradas, dashboard sem/com credenciais, teste visual no navegador, e confirmação de que `.env` nunca aparece no `git status`) — todos passaram como esperado.
 
 **Imprevisto registrado:** durante a sincronização dos arquivos para o repositório, a função "Download Folder" da extensão SFTP do VS Code sobrescreveu vários arquivos locais (`main.py`, `requirements.txt`, `static/index.html`) com conteúdo vazio, sem aviso de erro visível. Recuperado copiando o conteúdo real diretamente do celular (fonte da verdade) via `cat` na sessão SSH. Lição prática: sempre verificar conteúdo (`wc -l`, `cat`) depois de qualquer sincronização automática antes de commitar — "sincronizou sem erro aparente" não é garantia de que o conteúdo chegou íntegro.
+
+## Bateria real via ponte Termux:API
+
+A investigação da limitação de CPU (seção acima) deixou uma pista não testada: o pacote `Termux:API`, que acessa informações do sistema através das APIs do próprio Android, em vez de depender diretamente de `/proc`. Testei essa via — não resolveu CPU, mas resolveu bateria, que também estava pendente.
+
+**Descoberta sobre CPU:** `ls` nos binários `termux-*` mostra comandos para bateria, sensores, telefonia, câmera, áudio, Wi-Fi etc., mas nenhum para CPU/carga do sistema. Não encontrei uma API pública acessível ao Termux que forneça essa métrica de forma confiável. CPU permanece "N/D" no dashboard.
+
+**Bateria funcionou.** `termux-battery-status` retorna dados reais (percentual, status de carga, temperatura, saúde) — mas só funciona no Termux nativo, fora do proot, e a aplicação FastAPI roda dentro do proot. Foi necessário construir uma ponte:
+
+```
+Termux nativo                    proot (Debian)
+─────────────                    ───────────────
+battery-bridge.sh (loop 30s)
+  → termux-battery-status
+  → escreve em battery.json  ──→  mesmo arquivo, lido via
+     (caminho físico          caminho compartilhado
+     compartilhado com o          (/home/devops/apps/
+     proot)                        healthcheck/battery.json)
+                                        ↓
+                                  main.py lê o arquivo
+                                  e expõe via /api/status
+```
+
+**Problema encontrado:** chamadas a `termux-battery-status` feitas pelo script em segundo plano (via `nohup`) ficavam bloqueadas indefinidamente, mesmo funcionando normalmente quando rodado de forma interativa.
+
+**Causa:** otimização de bateria do Android no dispositivo Motorola, fazendo com que o app companheiro Termux:API deixasse de responder a chamadas feitas em background.
+
+**Solução:** desativação da otimização de bateria especificamente para o app Termux:API (`Ajustes > Apps > Termux:API > Bateria > Sem restrições`) e reinicialização completa do Termux.
+
+**Decisão de arquitetura:** a ponte roda como um script simples em loop (`while true; do ...; sleep 30; done`) em vez de um agendamento mais sofisticado, porque `cron` só existe dentro do proot — o Termux nativo (onde o `termux-battery-status` precisa rodar) não tem acesso a ele.
+
+**Resultado:** dashboard agora exibe percentual de bateria e status de carga (carregando/descarregando), atualizados a cada 30 segundos, junto com RAM e armazenamento.

@@ -9,6 +9,7 @@ import shutil
 import os
 import secrets
 import base64
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -46,6 +47,20 @@ class BasicAuthMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(BasicAuthMiddleware)
 
+def read_battery():
+    caminho = os.path.expanduser("~/apps/healthcheck/battery.json")
+    try:
+        with open(caminho, "r") as f:
+            data = json.load(f)
+        return {
+            "percentage": data.get("percentage"),
+            "status": data.get("status"),
+            "temperature": data.get("temperature"),
+            "health": data.get("health")
+        }
+    except Exception:
+        return None
+
 @app.get("/")
 def health():
     return {
@@ -64,7 +79,8 @@ def status():
         "ram_total_mb": round(psutil.virtual_memory().total / 1024 / 1024, 1),
         "disk_used_gb": round(disk.used / 1024 / 1024 / 1024, 1),
         "disk_total_gb": round(disk.total / 1024 / 1024 / 1024, 1),
-        "hostname": platform.node()
+        "hostname": platform.node(),
+        "battery": read_battery()
     }
 
 app.mount("/dashboard", StaticFiles(directory="static", html=True), name="static")
