@@ -16,6 +16,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [x] Dashboard web com métricas do sistema (RAM, armazenamento; CPU indisponível — ver seção abaixo)
 - [x] Autenticação HTTP Basic Auth protegendo API e dashboard
 - [x] Bateria real integrada ao dashboard via ponte Termux:API
+- [x] Script de startup único e idempotente (SSH, cron, fail2ban, aplicação, ponte de bateria)
 
 ## Arquitetura
 
@@ -194,3 +195,23 @@ battery-bridge.sh (loop 30s)
 **Decisão de arquitetura:** a ponte roda como um script simples em loop (`while true; do ...; sleep 30; done`) em vez de um agendamento mais sofisticado, porque `cron` só existe dentro do proot — o Termux nativo (onde o `termux-battery-status` precisa rodar) não tem acesso a ele.
 
 **Resultado:** dashboard agora exibe percentual de bateria e status de carga (carregando/descarregando), atualizados a cada 30 segundos, junto com RAM e armazenamento.
+
+## Script de startup único e idempotente
+
+Toda vez que o processo do Termux era encerrado (reinício do celular, app fechado pelo sistema, etc.), era necessário religar manualmente cinco componentes espalhados em duas camadas diferentes (SSH, cron, fail2ban e a aplicação dentro do proot; a ponte de bateria no Termux nativo) — repetitivo e propenso a esquecimento. Consolidei tudo em dois scripts encadeados.
+
+**Estrutura:**
+
+```
+~/start-homelab.sh (Termux nativo)
+  ├─ verifica/inicia battery-bridge.sh
+  └─ chama proot-distro login debian -- /root/start-all.sh
+       ├─ verifica/inicia SSH
+       ├─ verifica/inicia cron
+       ├─ verifica/inicia fail2ban
+       └─ verifica/inicia FastAPI
+```
+
+**Decisão de design: idempotência.** A primeira versão simplesmente iniciava tudo sem checar se já estava rodando — rodar o script duas vezes seguidas duplicou o processo da aplicação (dois `uvicorn` disputando a porta 8000). Corrigido adicionando uma verificação (`pgrep`) antes de cada ação: cada componente só é iniciado se ainda não estiver ativo, tornando seguro executar o script repetidamente sem duplicar os processos já ativos.
+
+**Uso:** um único comando (`~/start-homelab.sh`, no Termux nativo) substitui a sequência manual de comandos que era necessária a cada reinício.
