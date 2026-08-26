@@ -17,6 +17,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [x] Autenticação HTTP Basic Auth protegendo API e dashboard
 - [x] Bateria real integrada ao dashboard via ponte Termux:API
 - [x] Inicialização centralizada e idempotente dos serviços
+- [x] Save Manager (v1): sincronização de saves de PPSSPP e My OldBoy! via SFTP chrooted
 
 ## Índice
 
@@ -32,6 +33,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [Autenticação](#autenticação-protegendo-a-api-e-o-dashboard)
 - [Bateria](#bateria-real-via-ponte-termuxapi)
 - [Inicialização](#script-de-inicialização-único-e-idempotente)
+- [Save Manager e as limitações de isolamento de UID no proot](#save-manager-e-as-limitações-de-isolamento-de-uid-no-proot)
 
 ## Arquitetura
 
@@ -234,3 +236,54 @@ Toda vez que o processo do Termux era encerrado (reinício do celular, app fecha
 **Decisão de design: idempotência.** A primeira versão simplesmente iniciava tudo sem checar se já estava rodando — rodar o script duas vezes seguidas duplicou o processo da aplicação (dois `uvicorn` disputando a porta 8000). Corrigido adicionando uma verificação (`pgrep`) antes de cada ação: cada componente só é iniciado se ainda não estiver ativo, tornando seguro executar o script repetidamente sem duplicar os processos já ativos.
 
 **Uso:** um único comando (`~/start-homelab.sh`, no Termux nativo) substitui a sequência manual de comandos que era necessária sempre que o processo do Termux era encerrado.
+## Save Manager e as limitações de isolamento de UID no proot
+
+Primeiro serviço pessoal do projeto (fora do escopo estrito de DevSecOps, mas usado como pretexto para aprofundar infraestrutura): sincronização automática de saves de jogos emulados de um segundo celular (dedicado a jogar) para o E20.
+
+**Cenário:** três emuladores em uso — PPSSPP, My Boy! e My OldBoy! — cada um com sua própria convenção de armazenamento.
+
+**Descoberta de plataforma (Android 11+, scoped storage):**
+
+| Emulador | Local do save | Acessível sem root? |
+|---|---|---|
+| PPSSPP | Pasta pública configurável (`.../PSP/PPSSPP_STATE/`) | Sim |
+| My OldBoy! | Pasta pública fixa (`/MyOldBoy/save/`) | Sim |
+| My Boy! | `Android/data/com.fastemulator.gba/` (pasta interna do app) | **Não** — Android 11+ bloqueia acesso de outros apps a `Android/data/` de terceiros, mesmo com a permissão "Acesso a todos os arquivos" concedida ao Termux. O app não oferece opção de pasta alternativa. |
+
+**Decisão:** v1 cobre PPSSPP e My OldBoy!. My Boy! fica de fora, documentado como limitação de plataforma sem solução não-root conhecida — não uma lacuna do projeto.
+
+**Arquitetura:**
+
+```
+Celular de jogos (Termux)              Moto E20 (proot)
+──────────────────────────             ──────────────────
+chave SSH própria (não a do PC)
+  → autentica como usuário
+    dedicado `saves-sync`      ──SFTP──→  usuário isolado, sem shell,
+                                            preso via chroot a uma pasta
+```
+
+**Descoberta de segurança: propriedade de arquivo no proot não é confiável.** Ao configurar um usuário `saves-sync` dedicado (least privilege, seguindo o mesmo padrão do resto do projeto), um arquivo recebido via `scp` apareceu, ao ser inspecionado com `ls -la`/`stat`, pertencendo ora a `devops`, ora a `root`, ora a `saves-sync` — **dependendo de qual usuário estava consultando**, sem que o arquivo tivesse sido alterado entre as consultas. Reproduzido de forma controlada (mesmo arquivo, mesmo momento, três sessões de usuário diferentes consultando em sequência).
+
+**Causa:** o proot simula identidades/UIDs dentro do ambiente usando mecanismos de tradução de identidade, enquanto o filesystem continua sujeito às restrições do UID real do processo no Android. Na prática, a propriedade Unix observada dentro do proot não se mostrou consistente entre processos/usuários simulados e, portanto, a separação por UID entre usuários simulados (`devops`, `saves-sync`, etc.) não deve ser considerada uma fronteira de segurança confiável para controle de acesso a arquivos.
+
+**Mitigação:** em vez de depender da propriedade de arquivo (demonstrada como não-confiável nos testes), a restrição foi movida para uma camada que o OpenSSH aplica de forma real, independente do proot — configuração `Match User` no `sshd_config`:
+
+```
+Match User saves-sync
+    ChrootDirectory /home/saves-sync
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+    X11Forwarding no
+    PasswordAuthentication no
+```
+
+- `ChrootDirectory` confina o processo da sessão ao diretório definido pelo chroot — a sessão SFTP não consegue acessar caminhos fora do ambiente definido, independente de qualquer inconsistência de UID.
+- `ForceCommand internal-sftp` restringe a sessão a operações de transferência de arquivo — nunca abre um shell interativo, mesmo que a autenticação tenha sucesso.
+- Testado: uma tentativa de login SSH normal como `saves-sync` agora retorna `"This service allows sftp connections only"` e encerra a conexão; SFTP continua funcionando normalmente (`put`/`ls` testados com sucesso, `pwd` confirma o chroot ativo — raiz reportada como `/`).
+
+**Por que essa mitigação funciona onde a propriedade de arquivo falhou:** `ChrootDirectory` e `ForceCommand` são aplicados pelo próprio `sshd` no momento da autenticação — decisões de acesso a nível de processo/sessão, não de metadado de arquivo. Como a inconsistência observada é especificamente na camada de propriedade de arquivo simulada pelo proot, restringir por sessão SSH contorna o problema em vez de depender dele.
+
+**Modelo de segurança resultante:** o projeto não depende mais de permissões Unix baseadas nos UIDs simulados pelo proot para isolar `saves-sync`. O controle de acesso da sessão de transferência é realizado pelo próprio OpenSSH, através da combinação de autenticação por chave, `Match User`, `ChrootDirectory` e `ForceCommand`.
+
+**Exigência técnica do `ChrootDirectory`:** o OpenSSH exige que a pasta raiz do chroot (e todos os diretórios pai) pertençam a `root` e não tenham permissão de escrita para outros usuários — por isso a estrutura final ficou com `/home/saves-sync` pertencente a `root`, e uma subpasta `/home/saves-sync/upload/` (com `ppsspp/` e `myoldboy/` dentro) pertencente a `saves-sync`, que é onde a escrita de fato acontece.
