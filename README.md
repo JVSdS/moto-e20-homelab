@@ -18,6 +18,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [x] Bateria real integrada ao dashboard via ponte Termux:API
 - [x] Inicialização centralizada e idempotente dos serviços
 - [x] Save Manager (v1): sincronização de saves de PPSSPP e My OldBoy! via SFTP chrooted
+- [x] Automação da sincronização de saves via cron, com chave dedicada e defesa em profundidade
 
 ## Índice
 
@@ -34,6 +35,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [Bateria](#bateria-real-via-ponte-termuxapi)
 - [Inicialização](#script-de-inicialização-único-e-idempotente)
 - [Save Manager e as limitações de isolamento de UID no proot](#save-manager-e-as-limitações-de-isolamento-de-uid-no-proot)
+- [Automação do Save Manager](#automação-do-save-manager-chave-dedicada-e-agendamento)
 
 ## Arquitetura
 
@@ -287,3 +289,40 @@ Match User saves-sync
 **Modelo de segurança resultante:** o projeto não depende mais de permissões Unix baseadas nos UIDs simulados pelo proot para isolar `saves-sync`. O controle de acesso da sessão de transferência é realizado pelo próprio OpenSSH, através da combinação de autenticação por chave, `Match User`, `ChrootDirectory` e `ForceCommand`.
 
 **Exigência técnica do `ChrootDirectory`:** o OpenSSH exige que a pasta raiz do chroot (e todos os diretórios pai) pertençam a `root` e não tenham permissão de escrita para outros usuários — por isso a estrutura final ficou com `/home/saves-sync` pertencente a `root`, e uma subpasta `/home/saves-sync/upload/` (com `ppsspp/` e `myoldboy/` dentro) pertencente a `saves-sync`, que é onde a escrita de fato acontece.
+
+## Automação do Save Manager: chave dedicada e agendamento
+
+Com a base de segurança (usuário isolado, chroot, SFTP-only) validada, faltava automatizar a sincronização — rodar sozinha, sem exigir que eu conecte manualmente toda vez.
+
+**Problema: a chave SSH original tem passphrase.** Boa prática para uso interativo, mas inviável para automação — não há ninguém para digitar a senha quando o `cron` dispara o script sozinho.
+
+**Decisão: chave dedicada, sem passphrase, exclusiva para a automação**, em vez de manter a mesma chave interativa ou usar `ssh-agent` (que exigiria um processo em segundo plano sempre ativo — a mesma categoria de fragilidade já observada com o Termux:API sendo interrompido pelo Android). A chave interativa original permanece disponível separadamente, para conexões manuais.
+
+**Defesa em profundidade na própria linha do `authorized_keys`**, além da restrição já aplicada no `sshd_config` (`Match User`):
+
+```
+restrict,command="internal-sftp" ssh-ed25519 AAAA... celular-jogos-sync-automatico
+```
+
+`restrict` restringe/desabilita as principais formas de forwarding e alocação de PTY associadas à chave; combinado com `command="internal-sftp"`, impede que essa credencial seja usada para abrir uma sessão de shell ou executar comandos arbitrários. Resultado: mesmo que as restrições correspondentes no `sshd_config` sejam removidas ou alteradas por engano no futuro, essa chave ainda mantém as restrições declaradas em `authorized_keys` — duas camadas de restrição complementares (chave → `authorized_keys` → `sshd_config` → chroot → `internal-sftp`), não uma única camada da qual tudo depende.
+
+**Trade-off assumido conscientemente:** uma chave sem passphrase é mais arriscada se vazar (não exige senha adicional para uso). Mitigado pelo escopo já reduzido dessa credencial: mesmo comprometida, só permite SFTP, com a sessão confinada pelo chroot em `/home/saves-sync/` e escrita restrita a `/home/saves-sync/upload/` — não abre shell, não alcança o resto do sistema.
+
+**Script (`saves-sync.sh`, no celular de jogos):**
+
+```
+A cada execução:
+  1. Lê o arquivo-marcador contendo o timestamp da última sincronização concluída com sucesso
+  2. find [pasta do save] -newer [marcador] → lista só arquivos modificados desde então
+  3. Para cada arquivo modificado: envia via sftp (modo batch, sem interação)
+  4. Registra sucesso/erro em log
+  5. Se todas as transferências forem concluídas com sucesso, atualiza o marcador; se qualquer uma falhar, o marcador **não** é atualizado, para que os arquivos pendentes sejam tentados de novo na próxima execução (em vez de serem considerados "já sincronizados" por engano)
+```
+
+**Testado:** primeira execução enviou os 5 arquivos existentes (2 pastas, incluindo `.nomedia` oculto e nomes com espaços/parênteses do My OldBoy!, sem quebrar). Segunda execução, após gerar um save novo, enviou **apenas** os 2 arquivos alterados — confirmando que a detecção por timestamp funciona corretamente, sem reenviar o que já havia sido sincronizado.
+
+**Correção de confiabilidade (revisão pós-implementação):** a primeira versão do script atualizava o marcador incondicionalmente ao final, mesmo se alguma transferência tivesse falhado no meio do caminho — o que faria um arquivo com falha ser silenciosamente ignorado nas execuções seguintes (já que `find -newer` não o consideraria mais "modificado" em relação ao novo marcador). Corrigido: o marcador só avança se todas as transferências da execução tiverem sucesso; qualquer falha mantém o marcador no ponto anterior, garantindo nova tentativa no próximo ciclo.
+
+**Agendamento:** `cron` também não é nativo do Termux — o pacote correto é `cronie` (diferente do Debian, onde é `cron`), e o daemon é iniciado com `crond`, não `cron`. No ambiente atual, o `crond` não é iniciado automaticamente após o reinício do Termux — mesma limitação operacional já observada no E20 (não é uma propriedade absoluta do Termux, apenas o comportamento não configurado de auto-start neste setup). Agendado via `crontab -e` para rodar a cada 30 minutos.
+
+**Escopo da v1:** cobre PPSSPP e My OldBoy!. My Boy! permanece fora, pela limitação de scoped storage já documentada acima.
