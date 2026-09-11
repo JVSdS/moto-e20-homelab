@@ -19,6 +19,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [x] Inicialização centralizada e idempotente dos serviços
 - [x] Save Manager (v1): sincronização de saves de PPSSPP e My OldBoy! via SFTP chrooted
 - [x] Automação da sincronização de saves via cron, com chave dedicada e defesa em profundidade
+- [ ] Boot automático dos serviços via Termux:Boot (investigado e abandonado — ver seção abaixo; rotina permanece manual)
 
 ## Índice
 
@@ -36,6 +37,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [Inicialização](#script-de-inicialização-único-e-idempotente)
 - [Save Manager e as limitações de isolamento de UID no proot](#save-manager-e-as-limitações-de-isolamento-de-uid-no-proot)
 - [Automação do Save Manager](#automação-do-save-manager-chave-dedicada-e-agendamento)
+- [Investigação: Termux:Boot e daemons](#investigação-sshd-não-permanece-ativo-após-o-boot-via-termuxboot)
 
 ## Arquitetura
 
@@ -326,3 +328,38 @@ A cada execução:
 **Agendamento:** `cron` também não é nativo do Termux — o pacote correto é `cronie` (diferente do Debian, onde é `cron`), e o daemon é iniciado com `crond`, não `cron`. No ambiente atual, o `crond` não é iniciado automaticamente após o reinício do Termux — mesma limitação operacional já observada no E20 (não é uma propriedade absoluta do Termux, apenas o comportamento não configurado de auto-start neste setup). Agendado via `crontab -e` para rodar a cada 30 minutos.
 
 **Escopo da v1:** cobre PPSSPP e My OldBoy!. My Boy! permanece fora, pela limitação de scoped storage já documentada acima.
+
+## Investigação: `sshd` não permanece ativo após o boot via Termux:Boot
+
+Tentativa de eliminar a última rotina manual do projeto — religar os serviços à mão após cada reinício do celular — usando o app companheiro Termux:Boot para disparar `start-homelab.sh` automaticamente.
+
+**Configuração inicial:** app instalado (F-Droid), otimização de bateria desativada tanto para o Termux quanto para o Termux:Boot, script criado em `~/.termux/boot/`.
+
+**Primeira observação, não relacionada ao boot em si:** processos em segundo plano (incluindo os iniciados manualmente) mostraram-se instáveis ao trocar de app no primeiro teste — reproduzido de forma controlada (mesmo comando, mesma sequência, resultado consistente ao alternar para outro app). Investigado e descartado como causa principal do problema de boot: um teste posterior, sem trocar de app em nenhum momento, também apresentou o mesmo desaparecimento de processos.
+
+**Hipóteses testadas e descartadas:**
+
+- **Suspensão de CPU** — `termux-wake-lock`, adquirido dentro do próprio script de boot, não impediu o desaparecimento dos processos.
+- **Bateria adaptável do Android** — desativada nas configurações; sem efeito.
+- **"Início inteligente de apps" (gerenciamento de RAM específico Motorola)** — não existe nesse aparelho (Android 11; o recurso é exclusivo de versões mais recentes do software Motorola).
+- **Pressão de memória durante o pico de boot** — testado adiando o início dos serviços em 3 minutos (tempo de sobra para o sistema estabilizar). Memória disponível (`free -h`) permaneceu estável em ~926-945MB de 1.8GB total durante todo o monitoramento. Os processos morreram no mesmo padrão, independente do atraso. Hipótese descartada.
+
+**Teste em camadas, isolando onde a interrupção ocorre:**
+
+| Camada testada | Resultado |
+|---|---|
+| Script simples em loop (`while true; date; sleep 5`), direto no Termux nativo, sem proot | Sobreviveu 30+ minutos sem interrupção |
+| Mesmo loop simples, rodando **dentro** do proot (`proot-distro login debian -- bash -c '...'`) | Sobreviveu 6+ minutos sem interrupção |
+| `sshd` sozinho, dentro do proot, disparado pelo Termux:Boot | Comando retorna código 0 (sucesso), mas nenhum processo `sshd` existe após 3 minutos |
+
+**Observação:** o Termux:Boot consegue disparar `proot-distro login` e iniciar `sshd` dentro do proot, com código de saída 0. Um processo simples em loop contínuo, no mesmo ambiente (com ou sem proot), permanece ativo por dezenas de minutos sem problema. Já o `sshd` não é encontrado em execução poucos minutos depois de iniciado, mesmo com wake-lock ativo e memória disponível confortável.
+
+**Inferência:** o problema não é uma incapacidade geral do proot ou do Termux:Boot de manter processos de longa duração — o teste do loop simples exclui essa explicação. Nos testes realizados, o comportamento observado está associado ao processo daemonizado `sshd`.
+
+**Hipótese (não confirmada):** um log de erro, adicionado numa tentativa anterior, capturou a mensagem `proot info: vpid 1: terminated with signal 15` — SIGTERM, um sinal de encerramento solicitado, distinto de SIGKILL (que seria compatível com um encerramento forçado por pressão de memória). Isso é compatível com algum mecanismo do Android, do Termux ou do ciclo de vida associado ao Termux:Boot ativamente encerrando o processo em algum momento após a inicialização — em contraste com um processo continuamente ativo como o loop de teste. Essa hipótese é plausível, mas não identifica o componente exato responsável pelo envio do sinal, nem foi testada isoladamente.
+
+**Limitação da investigação:** o mecanismo exato responsável pelo encerramento não foi identificado. `dmesg` está bloqueado neste Android (mesma restrição já documentada para leitura de CPU) e o buffer do `logcat` não retém eventos até o momento de um boot anterior, impedindo confirmação via log do sistema.
+
+**Resultado da investigação:** não foi encontrada uma forma confiável de manter os serviços do homelab ativos usando o Termux:Boot. A automação foi abandonada não por impossibilidade de iniciar os serviços, mas por falta de persistência após a inicialização.
+
+**Decisão:** abandonada a tentativa de automatizar o boot via Termux:Boot para os serviços do homelab. A rotina após qualquer reinício do celular permanece manual: abrir o Termux e executar `~/start-homelab.sh`. O script em si continua correto e idempotente (comprovado em dezenas de execuções) — a limitação está na camada de disparo automático via boot, não na lógica de inicialização dos serviços.
