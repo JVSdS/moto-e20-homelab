@@ -1,11 +1,18 @@
 #!/bin/bash
 
 echo "Verificando SSH..."
-if ! pgrep -f "sshd: /usr/sbin/sshd" > /dev/null; then
+SSHD_COUNT=$(pgrep -f "sshd: /usr/sbin/sshd" | wc -l)
+if [ "$SSHD_COUNT" -eq 0 ]; then
     /usr/sbin/sshd -E /var/log/auth.log
     echo "  SSH iniciado."
+elif [ "$SSHD_COUNT" -eq 1 ]; then
+    echo "  SSH já estava rodando (1 instância)."
 else
-    echo "  SSH já estava rodando."
+    echo "  AVISO: $SSHD_COUNT instâncias de SSH detectadas — limpando e reiniciando."
+    pkill -f "sshd: /usr/sbin/sshd"
+    sleep 1
+    /usr/sbin/sshd -E /var/log/auth.log
+    echo "  SSH reiniciado após limpeza."
 fi
 
 echo "Verificando cron..."
@@ -18,6 +25,7 @@ fi
 
 echo "Verificando fail2ban..."
 if ! pgrep -f "fail2ban-server" > /dev/null; then
+    rm -f /var/run/fail2ban/fail2ban.pid
     fail2ban-client -x start
     echo "  fail2ban iniciado."
 else

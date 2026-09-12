@@ -20,6 +20,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [x] Save Manager (v1): sincronização de saves de PPSSPP e My OldBoy! via SFTP chrooted
 - [x] Automação da sincronização de saves via cron, com chave dedicada e defesa em profundidade
 - [ ] Boot automático dos serviços via Termux:Boot (investigado e abandonado — ver seção abaixo; rotina permanece manual)
+- [x] Limpeza técnica: locale, lock órfão do fail2ban, e correção de bug real de duplicação de SSH
 
 ## Índice
 
@@ -38,6 +39,7 @@ A ideia central: transformar um celular Android sem uso (Moto E20) num nó Linux
 - [Save Manager e as limitações de isolamento de UID no proot](#save-manager-e-as-limitações-de-isolamento-de-uid-no-proot)
 - [Automação do Save Manager](#automação-do-save-manager-chave-dedicada-e-agendamento)
 - [Investigação: Termux:Boot e daemons](#investigação-sshd-não-permanece-ativo-após-o-boot-via-termuxboot)
+- [Limpeza técnica e bug de duplicação SSH](#limpeza-técnica-e-um-bug-real-descoberto-no-processo)
 
 ## Arquitetura
 
@@ -363,3 +365,19 @@ Tentativa de eliminar a última rotina manual do projeto — religar os serviço
 **Resultado da investigação:** não foi encontrada uma forma confiável de manter os serviços do homelab ativos usando o Termux:Boot. A automação foi abandonada não por impossibilidade de iniciar os serviços, mas por falta de persistência após a inicialização.
 
 **Decisão:** abandonada a tentativa de automatizar o boot via Termux:Boot para os serviços do homelab. A rotina após qualquer reinício do celular permanece manual: abrir o Termux e executar `~/start-homelab.sh`. O script em si continua correto e idempotente (comprovado em dezenas de execuções) — a limitação está na camada de disparo automático via boot, não na lógica de inicialização dos serviços.
+
+## Limpeza técnica e um bug real descoberto no processo
+
+Revisão de pequenos itens acumulados ao longo do projeto, sem relação direta com nenhuma feature nova.
+
+**Locale ausente:** avisos `LC_CTYPE: cannot change locale (en_US.UTF-8)` apareciam em toda sessão SSH desde o início do projeto. Resolvido instalando `locales`, habilitando `en_US.UTF-8` em `/etc/locale.gen`, e rodando `locale-gen` + `update-locale`.
+
+**Lock órfão do fail2ban:** arquivo `/var/run/fail2ban/fail2ban.pid` referenciando um processo que não existia mais (sobra de uma execução anterior interrompida). Removido manualmente; `start-all.sh` agora remove esse arquivo preventivamente antes de tentar iniciar o fail2ban, evitando o erro "Server already running" em situações onde na verdade não há nada rodando.
+
+**Bug real descoberto: duplicação de processos `sshd`.** Durante os testes de locale, o SSH parou de aceitar conexões (`Connection refused`) mesmo com `start-homelab.sh` reportando sucesso. Diagnóstico: múltiplas instâncias de `/usr/sbin/sshd` haviam se acumulado de testes manuais anteriores na mesma sessão, executados sem verificar se já havia uma instância ativa. A duplicação deixava o estado do serviço inconsistente e estava associada às falhas de conexão na porta 8022. Resolvido matando todas as instâncias e reiniciando uma única vez.
+
+**Correção estrutural:** `start-all.sh` verificava apenas *se existia* alguma instância de `sshd` (`pgrep` sem contar quantas), o que não protegia contra duplicação acumulada por invocações manuais fora do fluxo do script. Corrigido para contar o número de instâncias e, se houver mais de uma, limpar todas e reiniciar uma única — script permanece idempotente mesmo diante de estado sujo por testes manuais anteriores.
+
+**Nota de rigor, sobre a investigação anterior do Termux:Boot:** avaliei se esse bug de duplicação poderia ter contaminado os testes da investigação de SIGTERM (seção acima). Como cada teste daquela investigação partiu de um reinício completo do celular, não havia acúmulo de instâncias entre os testes, como ocorreu no cenário atual (múltiplas invocações manuais na mesma sessão, sem reboot entre elas). A evidência do SIGTERM permanece válida.
+
+**Sanidade do `sshd_config`:** revisão completa após diversas edições ao longo do projeto (hardening inicial, porta 8022, bloco `Match User saves-sync`). `sshd -t` confirma sintaxe válida; leitura manual não encontrou contradição ou configuração órfã. Único ponto notado, não um problema: `PasswordAuthentication no` aparece tanto globalmente quanto dentro do bloco `Match User saves-sync` — redundante, mas inofensivo, e consistente com a prática de defesa em profundidade já adotada no projeto.
